@@ -31,9 +31,14 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['PROCESSED_FOLDER'] = PROCESSED_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
-# Ensure directories exist
-UPLOAD_FOLDER.mkdir(exist_ok=True)
-PROCESSED_FOLDER.mkdir(exist_ok=True)
+# Ensure directories exist with better error handling
+try:
+    UPLOAD_FOLDER.mkdir(exist_ok=True)
+    PROCESSED_FOLDER.mkdir(exist_ok=True)
+    print(f"DEBUG: Created directories - uploads: {UPLOAD_FOLDER.exists()}, processed: {PROCESSED_FOLDER.exists()}")
+except Exception as e:
+    print(f"ERROR: Failed to create directories: {e}")
+    logging.error(f"Directory creation failed: {e}")
 
 # Store active processing sessions
 processing_sessions = {}
