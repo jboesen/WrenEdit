@@ -41,7 +41,7 @@ def split_text_for_tiktok(text, max_chars=25):
     
     return segments
 
-def write_srt_tiktok_style(segments, file, speed_factor=1.25):
+def write_srt_tiktok_style(segments, file, speed_factor=1.0):
     """Write segments to SRT file with TikTok-style short captions and adjusted timing"""
     srt_index = 1
     
@@ -131,7 +131,7 @@ class VideoProcessor:
             else:
                 print(f"DEBUG: [Thread-{thread_id}] Tokenizers parallelism already disabled")
     
-    def run(self, cmd, timeout=90):  # 5 minute default timeout
+    def run(self, cmd, timeout=150):  # 5 minute default timeout
         """Thread-safe subprocess command execution with timeout"""
         thread_id = threading.get_ident()
         
@@ -293,11 +293,11 @@ class VideoProcessor:
         out = src.with_stem(src.stem + "_processed")
         print(f"DEBUG: Output file: {out}")
         
-        # First pass: detect silence and create audio filter
-        print("DEBUG: Detecting silence periods...")
+        # First pass: detect both silence and non-speech regions
+        print("DEBUG: Detecting silence and non-speech periods...")
         detect_cmd = [
             "ffmpeg", "-i", str(src), "-af", 
-            "silencedetect=noise=-35dB:duration=0.3", 
+            "silencedetect=noise=-20dB:duration=0.2,silencedetect=noise=-30dB:duration=0.1", 
             "-f", "null", "-"
         ]
         
@@ -312,12 +312,48 @@ class VideoProcessor:
         
         for line in lines:
             if 'silence_start:' in line:
-                silence_start = float(line.split('silence_start: ')[1].split()[0])
+                # Get the noise level from the line - with error handling
+                try:
+                    if 'noise=' in line:
+                        noise_level = float(line.split('noise=')[1].split('dB')[0])
+                    else:
+                        noise_level = -20  # default noise level
+                    silence_start = float(line.split('silence_start: ')[1].split()[0])
+                    # Store the noise level with the start time
+                    silence_start = (silence_start, noise_level)
+                except (IndexError, ValueError) as e:
+                    print(f"DEBUG: Error parsing silence_start line: {line}")
+                    print(f"DEBUG: Error details: {e}")
+                    continue
             elif 'silence_end:' in line and silence_start is not None:
-                silence_end = float(line.split('silence_end: ')[1].split()[0])
-                if silence_end - silence_start > 0.3:  # Only remove silences longer than 0.3s
-                    silence_periods.append((silence_start, silence_end))
-                silence_start = None
+                try:
+                    silence_end = float(line.split('silence_end: ')[1].split()[0])
+                    start_time, noise_level = silence_start
+                    # Only remove silences longer than 0.2s for -20dB or 0.1s for -30dB
+                    min_duration = 0.2 if noise_level == -20 else 0.1
+                    if silence_end - start_time > min_duration:
+                        silence_periods.append((start_time, silence_end))
+                    silence_start = None
+                except (IndexError, ValueError) as e:
+                    print(f"DEBUG: Error parsing silence_end line: {line}")
+                    print(f"DEBUG: Error details: {e}")
+                    silence_start = None
+                    continue
+        
+        # Merge overlapping or very close silence periods
+        if silence_periods:
+            silence_periods.sort(key=lambda x: x[0])
+            merged_periods = []
+            current_start, current_end = silence_periods[0]
+            
+            for start, end in silence_periods[1:]:
+                if start - current_end <= 0.1:  # Merge if gaps are less than 0.1s
+                    current_end = max(current_end, end)
+                else:
+                    merged_periods.append((current_start, current_end))
+                    current_start, current_end = start, end
+            merged_periods.append((current_start, current_end))
+            silence_periods = merged_periods
         
         print(f"DEBUG: Found {len(silence_periods)} silence periods to remove")
         
@@ -395,13 +431,13 @@ class VideoProcessor:
         else:
             # No silence detected, just apply speed adjustment
             print("DEBUG: No silence detected, just applying speed adjustment...")
-        self.run([
-            "ffmpeg", "-y", "-i", str(src),
+            self.run([
+                "ffmpeg", "-y", "-i", str(src),
                 "-filter_complex", "[0:v]setpts=0.8*PTS[v];[0:a]atempo=1.25[a]",
-            "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-c:a", "aac",
-            str(out)
-        ])
+                "-map", "[v]", "-map", "[a]",
+                "-c:v", "libx264", "-c:a", "aac",
+                str(out)
+            ])
         
         # Verify output
         if out.exists():
@@ -458,16 +494,16 @@ class VideoProcessor:
         print(f"DEBUG: Flash clip created: {flash_clip.stat().st_size} bytes")
         return flash_clip
 
-    def burn_captions(self, src, segments):
-        """Burn captions into video with proper font and TikTok style"""
-        print(f"DEBUG: Burning captions for {len(segments)} segments")
+    def burn_captions(self, src, segments, speed_factor=1.0):
+        """Burn captions into video with proper font and TikTok style - FIXED VERSION"""
+        print(f"DEBUG: Burning captions for {len(segments)} segments with speed_factor={speed_factor}")
         self._update_progress("Generating and burning captions", 80)
         
         srt_file = src.with_suffix(".srt")
         print(f"DEBUG: Creating SRT file: {srt_file}")
         
         with srt_file.open("w", encoding="utf-8") as f:
-            write_srt_tiktok_style(segments, f, speed_factor=1.25)
+            write_srt_tiktok_style(segments, f, speed_factor=speed_factor)
         
         # Verify SRT file was created
         if srt_file.exists():
@@ -486,52 +522,91 @@ class VideoProcessor:
 
         if font_file.exists():
             print("DEBUG: Using custom font with TikTok styling")
-            print("DEBUG: About to start ffmpeg caption burning - this may take several minutes...")
+            print("DEBUG: About to start ffmpeg caption burning...")
             
-            style = (
-                f"FontName={font_file.stem},"
-                "Fontsize=48,"
-                "PrimaryColour=&H00FFFFFF,"
-                "SecondaryColour=&H00000000,"
-                "OutlineColour=&H00000000,"
-                "BackColour=&H80000000,"
-                "Bold=1,"
-                "Italic=0,"
-                "Underline=0,"
-                "StrikeOut=0,"
-                "ScaleX=100,"
-                "ScaleY=100,"
-                "Spacing=0,"
-                "Angle=0,"
-                "BorderStyle=3,"
-                "Outline=2,"
-                "Shadow=0,"
-                "Alignment=2,"
-                "MarginL=0,"
-                "MarginR=0,"
-                "MarginV=50"
-            )
+            # SIMPLIFIED style - much less complex
+            style = "Fontsize=48,PrimaryColour=&H00FFFFFF,Bold=1,Outline=2,Alignment=2,MarginV=50"
             
+            # Try multiple encoder options with fallbacks
+            encoders_to_try = [
+                # Mac-friendly options first
+                {"video": "libx264", "preset": ["-preset", "faster"]},  # Faster preset
+                {"video": "libx264", "preset": ["-preset", "fast"]},    # Original fallback
+            ]
+            
+            success = False
+            last_error = None
+            
+            for i, encoder_config in enumerate(encoders_to_try):
+                try:
+                    print(f"DEBUG: Trying encoder option {i+1}: {encoder_config['video']}")
+                    
+                    cmd = [
+                        "ffmpeg", "-y", 
+                        "-i", str(src),
+                        "-vf", f"subtitles={str(srt_file)}:fontsdir={str(font_file.parent)}:force_style='{style}'",
+                        "-c:v", encoder_config["video"],
+                        *encoder_config["preset"],
+                        "-c:a", "copy",
+                        str(out)
+                    ]
+                    
+                    print(f"DEBUG: Command: {' '.join(cmd)}")
+                    print("DEBUG: Starting caption burning...")
+                    start_time = time.time()
+                    
+                    # Use longer timeout for caption burning as it's CPU intensive
+                    self.run(cmd, timeout=600)  # 10 minute timeout
+                    
+                    duration = time.time() - start_time
+                    print(f"DEBUG: Caption burning completed successfully in {duration:.2f}s")
+                    success = True
+                    break
+                    
+                except Exception as e:
+                    print(f"DEBUG: Encoder {encoder_config['video']} failed: {str(e)}")
+                    last_error = e
+                    continue
+            
+            if not success:
+                print("DEBUG: All encoders failed, trying minimal command...")
+                # Last resort: minimal command without hardware acceleration
+                try:
+                    cmd = [
+                        "ffmpeg", "-y", 
+                        "-i", str(src),
+                        "-vf", f"subtitles={str(srt_file)}",  # No custom font/style
+                        "-c:v", "libx264",
+                        "-c:a", "copy",
+                        str(out)
+                    ]
+                    
+                    print(f"DEBUG: Minimal command: {' '.join(cmd)}")
+                    self.run(cmd, timeout=600)
+                    print("DEBUG: Minimal caption burning succeeded")
+                    success = True
+                    
+                except Exception as e:
+                    print(f"DEBUG: Even minimal command failed: {str(e)}")
+                    last_error = e
+            
+            if not success:
+                raise RuntimeError(f"All caption burning methods failed. Last error: {last_error}")
+                
+        else:
+            print("DEBUG: ERROR - Font file not found, using default font")
+            # Fallback without custom font
             cmd = [
-                "ffmpeg", "-y", "-i", str(src),
-                "-vf", f"subtitles={str(srt_file)}:fontsdir={font_file.parent}:force_style='{style}'",
+                "ffmpeg", "-y", 
+                "-i", str(src),
+                "-vf", f"subtitles={str(srt_file)}",
+                "-c:v", "libx264",
+                "-preset", "fast",
                 "-c:a", "copy",
                 str(out)
             ]
             
-            print("DEBUG: Starting caption burning with extended timeout (10 minutes)...")
-            start_time = time.time()
-            
-            # Use longer timeout for caption burning as it's CPU intensive
-            # self.run(cmd, timeout=600)  # 10 minute timeout for caption burning
-            
-            duration = time.time() - start_time
-            print(f"DEBUG: Caption burning completed in {duration:.2f}s")
-            
-        else:
-            print("DEBUG: ERROR - Font file not found, this should not happen!")
-            print(f"DEBUG: Tried to find font at: {font_file}")
-            raise FileNotFoundError(f"Font file not found: {font_file}")
+            self.run(cmd, timeout=600)
         
         # Verify output
         if out.exists():
@@ -545,7 +620,7 @@ class VideoProcessor:
         
         self._update_progress("Captions burned successfully", 85)
         return out
-    
+
     def concat_clips_with_transition(self, hook, flash, main, out):
         """Concatenate hook, flash transition, and main video with format normalization"""
         print(f"DEBUG: Concatenating {hook}, {flash}, and {main} into {out}")
@@ -689,7 +764,7 @@ class VideoProcessor:
             raise
 
     def process(self, source_file, output_file):
-        """Main processing function with race condition detection and lower timeouts"""
+        """Main processing function with captions burned first to prevent desync"""
         try:
             src = Path(source_file).resolve()
             out = Path(output_file).resolve()
@@ -707,20 +782,24 @@ class VideoProcessor:
             print("DEBUG: [Main] === STEP 1: TRANSCRIPTION ===")
             segments = self.transcribe(src)
             
-            # Step 2: Hook detection (sequential)
-            print("DEBUG: [Main] === STEP 2: HOOK DETECTION ===")
+            # Step 2: Burn captions on original video (sequential)  
+            print("DEBUG: [Main] === STEP 2: BURN CAPTIONS ON ORIGINAL VIDEO ===")
+            captioned_src = self.burn_captions(src, segments, speed_factor=1.0)
+            
+            # Step 3: Hook detection (sequential)
+            print("DEBUG: [Main] === STEP 3: HOOK DETECTION ===")
             hook_info = self.find_hook(segments)
             
-            # Steps 3 & 4: Parallel processing with race condition detection
-            print("DEBUG: [Main] === STEPS 3 & 4: PARALLEL PROCESSING ===")
+            # Steps 4 & 5: Parallel processing with race condition detection
+            print("DEBUG: [Main] === STEPS 4 & 5: PARALLEL PROCESSING ===")
             print("DEBUG: [Main] Creating thread pool executor...")
             
             hook_clip = None
             processed_main = None
             
             # Lower timeouts for faster failure detection
-            hook_timeout = 120    # 2 minutes (was 5 minutes)
-            silence_timeout = 180 # 3 minutes (was 10 minutes)
+            hook_timeout = 120    # 2 minutes
+            silence_timeout = 180 # 3 minutes
             
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -728,11 +807,11 @@ class VideoProcessor:
                     
                     hook_future = executor.submit(
                         self._extract_clip_wrapper, 
-                        src, hook_info["start"], hook_info["end"]
+                        captioned_src, hook_info["start"], hook_info["end"]  # Use captioned video
                     )
                     processed_future = executor.submit(
                         self._remove_silence_wrapper, 
-                        src
+                        captioned_src  # Use captioned video
                     )
                     
                     print("DEBUG: [Main] Waiting for hook extraction...")
@@ -776,17 +855,17 @@ class VideoProcessor:
                     print(f"DEBUG: [Main] processed_main path: {processed_main}")
                 raise RuntimeError("Silence removal failed verification")
             
-            # Remaining steps sequential...
-            print("DEBUG: [Main] === STEP 5: ADDING FLASH TRANSITION ===")
+            # Step 6: Add flash transition
+            print("DEBUG: [Main] === STEP 6: ADDING FLASH TRANSITION ===")
             flash_clip = self.add_flash_transition(hook_clip, processed_main)
             
-            # Skip caption burning for testing
-            print("DEBUG: [Main] === STEP 6: SKIPPING CAPTION BURNING FOR TESTING ===")
-            # captioned_main = self.burn_captions(processed_main, segments)
-            captioned_main = processed_main  # Use processed main directly without captions
-            
+            # Step 7: Final concatenation (no more caption burning needed)
             print("DEBUG: [Main] === STEP 7: FINAL CONCATENATION ===")
-            self.concat_clips_with_transition(hook_clip, flash_clip, captioned_main, out)
+            self.concat_clips_with_transition(hook_clip, flash_clip, processed_main, out)
+            
+            # Clean up captioned source file
+            captioned_src.unlink(missing_ok=True)
+            print("DEBUG: [Main] Captioned source file cleaned up")
             
             final_metadata = {
                 'processing_complete': True,
