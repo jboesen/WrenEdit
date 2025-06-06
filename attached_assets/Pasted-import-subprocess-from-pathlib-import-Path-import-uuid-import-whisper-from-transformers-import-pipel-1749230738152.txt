@@ -1,0 +1,95 @@
+import subprocess
+from pathlib import Path
+import uuid
+import whisper
+from transformers import pipeline
+
+emotion = pipeline(
+    "text-classification",
+    model="tasinhoque/text-classification-goemotions",
+    top_k=None,
+    truncation=True,
+)  # downloads once, then cached :contentReference[oaicite:0]{index=0}
+
+model = whisper.load_model("medium")  # downloads once (≈1.4 GB)
+
+def run(cmd: list[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+def transcribe(video_path: Path):
+    return model.transcribe(video_path.as_posix())["segments"]  # list dicts
+
+def find_hook(segments, min_s=3.0, max_s=6.0):
+    best = None
+    for seg in segments:
+        dur = seg["end"] - seg["start"]
+        if not (min_s <= dur <= max_s):
+            continue
+        scores = emotion(seg["text"])[0]  # list dicts
+        score = sum(
+            item["score"]
+            for item in scores
+            if item["label"] in {"joy", "amusement", "surprise"}
+        )
+        if best is None or score > best["score"]:
+            best = {"start": seg["start"], "end": seg["end"], "score": score}
+    if best is None:
+        # fallback: first sentence under max_s
+        for seg in segments:
+            if seg["end"] - seg["start"] <= max_s:
+                best = {"start": seg["start"], "end": seg["end"], "score": 0.0}
+                break
+    return best
+
+def extract_clip(src: Path, start: float, end: float) -> Path:
+    out = src.with_stem("hook_" + uuid.uuid4().hex)
+    run([
+        "ffmpeg", "-y", "-i", src, "-ss", f"{start}", "-to", f"{end}",
+        "-c", "copy", out.as_posix()
+    ])
+    return out
+
+def remove_silence(src: Path) -> Path:
+    out = src.with_stem(src.stem + "_nosilence")
+    run([
+        "ffmpeg", "-y", "-i", src, "-af",
+        "silenceremove=start_periods=1:start_duration=0.3:start_threshold=-35dB",
+        out.as_posix()
+    ])
+    return out
+
+def burn_captions(src: Path, segments) -> Path:
+    srt = src.with_suffix(".srt")
+    whisper.utils.write_srt(segments, file=srt.open("w", encoding="utf-8"))
+    out = src.with_stem(src.stem + "_captioned")
+    run([
+        "ffmpeg", "-y", "-i", src, "-vf",
+        f"subtitles={srt.as_posix()}:force_style='Fontsize=48'",
+        out.as_posix()
+    ])
+    return out
+
+def concat_clips(hook: Path, main: Path, out: Path) -> None:
+    lst = main.with_suffix(".txt")
+    lst.write_text(f"file '{hook.resolve()}'\nfile '{main.resolve()}'\n")
+    run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst.as_posix(),
+        "-c", "copy", out.as_posix()
+    ])
+    lst.unlink()
+
+def process(source_file: str, output_file: str) -> None:
+    src = Path(source_file).resolve()
+    segments = transcribe(src)
+    hook_info = find_hook(segments)
+    hook_clip = extract_clip(src, hook_info["start"], hook_info["end"])
+    trimmed = remove_silence(src)
+    captioned = burn_captions(trimmed, segments)
+    concat_clips(hook_clip, captioned, Path(output_file).resolve())
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 3:
+        print("usage: python auto_edit.py <input.mp4> <output.mp4>")
+        sys.exit(1)
+    process(*sys.argv[1:])
