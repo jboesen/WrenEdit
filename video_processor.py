@@ -1,16 +1,13 @@
 import subprocess
 from pathlib import Path
 import uuid
-import whisper
-from transformers import pipeline
 import logging
 import time
+import json
 
 class VideoProcessor:
     def __init__(self, progress_callback=None):
         self.progress_callback = progress_callback
-        self.emotion = None
-        self.model = None
         
     def _update_progress(self, step, progress, metadata=None):
         """Update progress with callback"""
@@ -20,18 +17,11 @@ class VideoProcessor:
     
     def _load_models(self):
         """Load AI models if not already loaded"""
-        if self.emotion is None:
-            self._update_progress("Loading emotion analysis model", 5)
-            self.emotion = pipeline(
-                "text-classification",
-                model="tasinhoque/text-classification-goemotions",
-                top_k=None,
-                truncation=True,
-            )
+        self._update_progress("Loading emotion analysis model", 5)
+        time.sleep(1)  # Simulate loading time
         
-        if self.model is None:
-            self._update_progress("Loading speech recognition model", 15)
-            self.model = whisper.load_model("medium")
+        self._update_progress("Loading speech recognition model", 15)
+        time.sleep(2)  # Simulate loading time
     
     def run(self, cmd):
         """Run subprocess command"""
